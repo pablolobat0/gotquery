@@ -4,4 +4,9 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi[standard]>=0.115.12",
+    "hf-xet>=1.0.2",
+    "pymilvus>=2.5.6",
+    "sentence-transformers>=4.0.2",
+]
