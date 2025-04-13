@@ -1,13 +1,11 @@
+from mcp.server.fastmcp import FastMCP
+from pymilvus import MilvusClient
 from sentence_transformers import SentenceTransformer
-from app.db.client import get_client
 import json
 
+DB_PATH = "../../milvus.db"
 # Carga del modelo liviano en GPU (o 'cpu' si no hay GPU)
 model_st = SentenceTransformer("paraphrase-MiniLM-L6-v2", device="cuda")
-
-
-def encode_documents(documents):
-    return model_st.encode(documents)
 
 
 DATA_PATH = "./data/season1.json"
@@ -26,6 +24,10 @@ EPISODES_NAMES = [
 ]
 
 DIMENSION = 384
+
+
+def encode_documents(documents):
+    return model_st.encode(documents)
 
 
 def init_collections():
@@ -65,3 +67,42 @@ def init_collections():
                 )
 
         client.insert(collection_name="game_of_thrones", data=data)
+
+
+def get_client() -> MilvusClient:
+    return MilvusClient(DB_PATH)
+
+
+def get_subtitle_by_query(query: str):
+    client = get_client()
+
+    query_vectors = encode_documents([query])
+
+    result = client.search(
+        collection_name="game_of_thrones",
+        data=query_vectors,
+        limit=5,
+        output_fields=["season", "episode", "quote"],
+    )
+
+    return result
+
+
+# Initialize FastMCP server
+mcp = FastMCP("gotquery")
+
+
+@mcp.tool()
+def get_subtitles(query: str):
+    """Get Game of Thrones season 1 subtitles related to a query.
+
+    Args:
+        query: User text.
+    """
+    return get_subtitle_by_query(query)
+
+
+if __name__ == "__main__":
+    # Initialize and run the server
+    print("Ejecutando...")
+    mcp.run(transport="stdio")
