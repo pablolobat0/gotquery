@@ -1,11 +1,18 @@
 from contextlib import AsyncExitStack
 import os
-from anthropic.types import MessageParam
+from anthropic.types import (
+    MessageParam,
+    TextBlockParam,
+    ToolParam,
+    ToolResultBlockParam,
+    ToolUnionParam,
+    ToolUseBlockParam,
+)
 from fastapi import APIRouter, status
 from app.schemas.query import Query
 from anthropic import Anthropic
 from dotenv import load_dotenv
-from mcp import StdioServerParameters, ClientSession, stdio_client
+from mcp import StdioServerParameters, ClientSession, Tool, stdio_client
 
 load_dotenv()
 
@@ -20,67 +27,108 @@ query_router = APIRouter()
 async def get_response(query: Query):
     messages = [MessageParam(role=query.role, content=query.content)]
 
-    server_params = StdioServerParameters(command="python", args["../mcp/tools.py"], env=None)
-
-    exit = AsyncExitStack()
-
-    stdio_transport = await exit.enter_async_context(stdio_client(server_params))
-    stdio, write = stdio_transport
-    session = await exit(ClientSession(stdio, write))
-
-    await session.initialize()
-
-    # List available tools
-    response = await session.list_tools()
-    tools = response.tools
-
-
-    response = Anthropic(api_key=API_KEY).messages.create(
-        model=MODEL,
-        max_tokens=1000,
-        messages=messages,
-        tools=tools
+    server_params = StdioServerParameters(
+        command="python", args=["mcp_server/tools.py"], env=None
     )
 
-    final_text: list[Query] = []
-    assistant_message_content = []
+    final_text = []
 
-    for content in response.content:
-        if content.type =="text":
-            final_text.append(Query(role="assistant", content=content.text))
-            assistant_message_content.append(content.text)
-        elif content.type == "tool_use":
-            tool_name = content.name
-            tool_args = content.input
+    async with AsyncExitStack() as stack:
+        stdio_transport = await stack.enter_async_context(stdio_client(server_params))
+        stdio, write = stdio_transport
+        session = await stack.enter_async_context(ClientSession(stdio, write))
+        await session.initialize()
 
-            # Execute tool call
-            result = await session.call_tool(tool_name, tool_args)
-            final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+        # List available tools
+        response = await session.list_tools()
+        tools: list[Tool] = response.tools
 
-            assistant_message_content.append(content)
-            messages.append({
-                "role": "assistant",
-                "content": assistant_message_content
-            })
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": content.id,
-                        "content": result.content
-                    }
-                ]
-            })
+        tools_conv: list[ToolUnionParam] = []
+        for tool in tools:
+            description = ""
+            if tool.description is not None:
+                description = tool.description
 
-            # Get next response from Claude
-            response = Anthropic(api_key=API_KEY).messages.create(
-                model=MODEL,
-                max_tokens=1000,
-                messages=messages,
-                tools=tools
+            converted_tool: ToolUnionParam = ToolParam(
+                name=tool.name,
+                description=description,
+                input_schema=tool.inputSchema,
             )
 
-            final_text.append(response.content[0].text)
+            tools_conv.append(converted_tool)
 
-    return final_text
+        llm = Anthropic(api_key=API_KEY)
+        response = llm.messages.create(
+            model=MODEL, max_tokens=1000, messages=messages, tools=tools_conv
+        )
+
+        assistant_message_content = []
+
+        for content in response.content:
+            if content.type == "text":
+                final_text.append(Query(role="assistant", content=content.text))
+                assistant_message_content.append(content.text)
+            elif content.type == "tool_use":
+                tool_name = content.name
+                tool_args = content.input
+
+                # Execute tool call
+                result = await session.call_tool(tool_name, tool_args)
+                final_text.append(
+                    Query(
+                        role="assistant",
+                        content=f"[Calling tool {tool_name} with args {tool_args}]",
+                    )
+                )
+
+                messages.append(
+                    MessageParam(
+                        role="assistant",
+                        content=[
+                            ToolUseBlockParam(
+                                id=content.id,
+                                type=content.type,
+                                name=content.name,
+                                input=content.input,
+                            )
+                        ],
+                    )
+                )
+
+                converted_content: list[TextBlockParam] = [
+                    TextBlockParam(type="text", text=tc.text) for tc in result.content
+                ]
+
+                messages.append(
+                    MessageParam(
+                        role="user",
+                        content=[
+                            ToolResultBlockParam(
+                                tool_use_id=content.id,
+                                type="tool_result",
+                                content=converted_content,
+                            ),
+                        ],
+                    ),
+                )
+
+                # Get next response from Claude
+                response = llm.messages.create(
+                    model=MODEL, max_tokens=1000, messages=messages, tools=tools_conv
+                )
+
+                print(response)
+
+                if response.type == "message":
+                    final_text.append(
+                        Query(role="assistant", content=response.content[0].text)
+                    )
+                else:
+                    final_text.append(
+                        Query(
+                            role="assistant",
+                            content="[Respuesta inesperada al usar la herramienta]",
+                        )
+                    )
+
+        return final_text
